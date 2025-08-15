@@ -1,28 +1,30 @@
 import os
-import logging
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import Command
+from aiogram.types import FSInputFile
 import sqlite3
 import pandas as pd
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.state import StatesGroup, State
-from aiogram import F
+import asyncio
 
-# ---------------------- ЛОГИ ----------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Загружаем .env
+load_dotenv()
+TOKEN = os.getenv("TOKEN")
+ADMINS = os.getenv("ADMINS").split(",")
 
-# ---------------------- ПЕРЕМЕННЫЕ ----------------------
-TOKEN = os.environ.get("7294777489:AAFMvo3UvtnuOvpYyDIldCi0GuGyrTvyZHM")
-ADMINS = os.environ.get("329116625", "866826839")
-ADMINS = [int(x.strip()) for x in ADMINS.split(",") if x.strip().isdigit()]
+if not TOKEN:
+    raise ValueError("TOKEN не найден! Проверь .env файл или переменные окружения.")
 
-# ---------------------- БАЗА ДАННЫХ ----------------------
-conn = sqlite3.connect("markets.db")
-cursor = conn.cursor()
-cursor.execute("""CREATE TABLE IF NOT EXISTS markets(
+# Инициализация бота
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# --- Работа с базой ---
+DB_FILE = "markets.db"
+conn = sqlite3.connect(DB_FILE)
+cur = conn.cursor()
+cur.execute("""CREATE TABLE IF NOT EXISTS markets(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
     latitude REAL,
@@ -30,107 +32,67 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS markets(
 )""")
 conn.commit()
 
-# ---------------------- FSM ----------------------
-storage = MemoryStorage()
+# --- Команды для админов ---
+@dp.message(Command(commands=["import"]))
+async def cmd_import(message: types.Message):
+    if str(message.from_user.id) not in ADMINS:
+        await message.answer("У тебя нет прав для этой команды.")
+        return
+    await message.answer("Пришли Excel файл для импорта маркетов.")
 
-class ImportStates(StatesGroup):
-    waiting_file = State()
-
-# ---------------------- БОТ ----------------------
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=storage)
-
-# ---------------------- ФУНКЦИИ ----------------------
-def fetch_all_markets():
-    cursor.execute("SELECT id, name FROM markets")
-    return cursor.fetchall()
-
-def import_markets_from_excel(file_path):
-    df = pd.read_excel(file_path)
-    cursor.execute("DELETE FROM markets")  # Полное замещение
-    for _, row in df.iterrows():
-        if pd.isna(row["name"]) or pd.isna(row["latitude"]) or pd.isna(row["longitude"]):
-            continue
-        cursor.execute(
-            "INSERT INTO markets (name, latitude, longitude) VALUES (?, ?, ?)",
-            (row["name"], float(row["latitude"]), float(row["longitude"]))
-        )
-    conn.commit()
-
-def export_markets_to_excel(file_path):
-    cursor.execute("SELECT name, latitude, longitude FROM markets")
-    rows = cursor.fetchall()
-    df = pd.DataFrame(rows, columns=["name", "latitude", "longitude"])
+@dp.message(Command(commands=["export"]))
+async def cmd_export(message: types.Message):
+    if str(message.from_user.id) not in ADMINS:
+        await message.answer("У тебя нет прав для этой команды.")
+        return
+    df = pd.read_sql("SELECT * FROM markets", conn)
+    file_path = "export.xlsx"
     df.to_excel(file_path, index=False)
+    await message.answer_document(FSInputFile(file_path), caption="Экспорт маркетов.")
 
-def make_market_keyboard():
-    markets = fetch_all_markets()
-    kb = InlineKeyboardMarkup(row_width=2)
-    for _, name in markets:
-        kb.add(InlineKeyboardButton(text=name, callback_data=f"market_{name}"))
-    return kb
+# --- Обработка присланного Excel ---
+@dp.message(lambda message: message.document and str(message.from_user.id) in ADMINS)
+async def excel_upload(message: types.Message):
+    file_id = message.document.file_id
+    file_path = f"{file_id}.xlsx"
+    await bot.download_file_by_id(file_id, destination=file_path)
+    df = pd.read_excel(file_path)
+    cur.execute("DELETE FROM markets")  # очищаем старые маркеты
+    for _, row in df.iterrows():
+        cur.execute("INSERT INTO markets(name, latitude, longitude) VALUES(?,?,?)",
+                    (row['name'], row['latitude'], row['longitude']))
+    conn.commit()
+    await message.answer(f"Импортировано {len(df)} маркетов!")
 
-# ---------------------- ХЕНДЛЕРЫ ----------------------
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    kb = make_market_keyboard()
+# --- Список маркетов для всех пользователей ---
+@dp.message(Command(commands=["markets"]))
+async def cmd_markets(message: types.Message):
+    cur.execute("SELECT name FROM markets")
+    rows = cur.fetchall()
+    if not rows:
+        await message.answer("Маркетов нет.")
+        return
+    kb_builder = InlineKeyboardBuilder()
+    for (name,) in rows:
+        kb_builder.button(text=name, callback_data=f"market:{name}")
+    kb = kb_builder.as_markup(row_width=2)
     await message.answer("Выберите маркет:", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("market_"))
-async def market_selected(query: types.CallbackQuery):
-    name = query.data.replace("market_", "")
-    cursor.execute("SELECT latitude, longitude FROM markets WHERE name = ?", (name,))
-    row = cursor.fetchone()
+# --- Обработка выбора маркетов ---
+@dp.callback_query(lambda c: c.data and c.data.startswith("market:"))
+async def market_callback(callback: types.CallbackQuery):
+    name = callback.data.split("market:")[1]
+    cur.execute("SELECT latitude, longitude FROM markets WHERE name=?", (name,))
+    row = cur.fetchone()
     if row:
         lat, lon = row
-        await query.message.answer_location(latitude=lat, longitude=lon)
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("Да", callback_data="choose_another"))
-        await query.message.answer("Хотите выбрать другой маркет?", reply_markup=kb)
-    await query.answer()
+        await callback.message.answer(f"{name}\nhttps://www.google.com/maps?q={lat},{lon}")
+    await callback.answer()
 
-@dp.callback_query(F.data=="choose_another")
-async def choose_another(query: types.CallbackQuery):
-    kb = make_market_keyboard()
-    await query.message.answer("Выберите маркет:", reply_markup=kb)
-    await query.answer()
+# --- Старт бота ---
+async def main():
+    print("Бот запущен!")
+    await dp.start_polling(bot)
 
-# ---------------------- АДМИН ----------------------
-@dp.message(Command("import"))
-async def cmd_import(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
-        return
-    await message.answer("Отправьте Excel файл с маркетами (.xlsx)")
-    await state.set_state(ImportStates.waiting_file)
-
-@dp.message(F.document, ImportStates.waiting_file)
-async def excel_upload(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMINS:
-        return
-    file = await message.document.download(destination_dir=".")
-    import_markets_from_excel(file.name)
-    await message.answer(f"Маркетов импортировано успешно: {len(fetch_all_markets())}")
-    await state.clear()
-
-@dp.message(Command("export"))
-async def cmd_export(message: Message):
-    if message.from_user.id not in ADMINS:
-        return
-    file_path = "markets_export.xlsx"
-    export_markets_to_excel(file_path)
-    await message.answer_document(types.InputFile(file_path))
-
-# ---------------------- МЕНЮ ----------------------
-@dp.message(Command("menu"))
-async def cmd_menu(message: Message):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Выбрать маркет", callback_data="choose_another"))
-    if message.from_user.id in ADMINS:
-        kb.add(InlineKeyboardButton("Импорт маркетов", callback_data="admin_import"))
-        kb.add(InlineKeyboardButton("Экспорт маркетов", callback_data="admin_export"))
-    await message.answer("Меню:", reply_markup=kb)
-
-# ---------------------- ЗАПУСК ----------------------
 if __name__ == "__main__":
-    logger.info("Стартуем бота...")
-    dp.start_polling(bot)
+    asyncio.run(main())
