@@ -1,98 +1,112 @@
-import os
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.filters import Command
-from aiogram.types import FSInputFile
-import sqlite3
-import pandas as pd
 import asyncio
+import sqlite3
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+import pandas as pd
 
-# Загружаем .env
-load_dotenv()
-TOKEN = os.getenv("TOKEN")
-ADMINS = os.getenv("ADMINS").split(",")
+# ===== Конфигурация =====
+TOKEN = "7294777489:AAFMvo3UvtnuOvpYyDIldCi0GuGyrTvyZHM"
+ADMINS = [329116625, 866826839]  # Список ID админов
 
-if not TOKEN:
-    raise ValueError("TOKEN не найден! Проверь .env файл или переменные окружения.")
+DB_PATH = "markets.db"
 
-# Инициализация бота
+# ===== Инициализация бота =====
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- Работа с базой ---
-DB_FILE = "markets.db"
-conn = sqlite3.connect(DB_FILE)
-cur = conn.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS markets(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    latitude REAL,
-    longitude REAL
-)""")
-conn.commit()
-
-# --- Команды для админов ---
-@dp.message(Command(commands=["import"]))
-async def cmd_import(message: types.Message):
-    if str(message.from_user.id) not in ADMINS:
-        await message.answer("У тебя нет прав для этой команды.")
-        return
-    await message.answer("Пришли Excel файл для импорта маркетов.")
-
-@dp.message(Command(commands=["export"]))
-async def cmd_export(message: types.Message):
-    if str(message.from_user.id) not in ADMINS:
-        await message.answer("У тебя нет прав для этой команды.")
-        return
-    df = pd.read_sql("SELECT * FROM markets", conn)
-    file_path = "export.xlsx"
-    df.to_excel(file_path, index=False)
-    await message.answer_document(FSInputFile(file_path), caption="Экспорт маркетов.")
-
-# --- Обработка присланного Excel ---
-@dp.message(lambda message: message.document and str(message.from_user.id) in ADMINS)
-async def excel_upload(message: types.Message):
-    file_id = message.document.file_id
-    file_path = f"{file_id}.xlsx"
-    await bot.download_file_by_id(file_id, destination=file_path)
-    df = pd.read_excel(file_path)
-    cur.execute("DELETE FROM markets")  # очищаем старые маркеты
-    for _, row in df.iterrows():
-        cur.execute("INSERT INTO markets(name, latitude, longitude) VALUES(?,?,?)",
-                    (row['name'], row['latitude'], row['longitude']))
+# ===== Работа с базой =====
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS markets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            latitude REAL,
+            longitude REAL
+        )
+    """)
     conn.commit()
-    await message.answer(f"Импортировано {len(df)} маркетов!")
+    conn.close()
 
-# --- Список маркетов для всех пользователей ---
-@dp.message(Command(commands=["markets"]))
-async def cmd_markets(message: types.Message):
-    cur.execute("SELECT name FROM markets")
-    rows = cur.fetchall()
-    if not rows:
-        await message.answer("Маркетов нет.")
+def add_markets_from_df(df):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM markets")  # Полная замена
+    for _, row in df.iterrows():
+        c.execute(
+            "INSERT INTO markets (name, latitude, longitude) VALUES (?, ?, ?)",
+            (row['name'], row['latitude'], row['longitude'])
+        )
+    conn.commit()
+    conn.close()
+
+def get_all_markets():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT name, latitude, longitude FROM markets")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# ===== Клавиатура для обычного пользователя =====
+def make_user_keyboard():
+    kb = InlineKeyboardMarkup(row_width=2)
+    markets = get_all_markets()
+    for name, lat, lon in markets:
+        kb.add(InlineKeyboardButton(name, callback_data=f"{lat},{lon}"))
+    return kb
+
+# ===== Хэндлеры =====
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer("Привет! Вот список маркетов:", reply_markup=make_user_keyboard())
+
+# ===== Админ команды =====
+
+@dp.message(Command("import"))
+async def cmd_import(message: Message):
+    if message.from_user.id not in ADMINS:
+        await message.answer("Нет прав для этой команды.")
         return
-    kb_builder = InlineKeyboardBuilder()
-    for (name,) in rows:
-        kb_builder.button(text=name, callback_data=f"market:{name}")
-    kb = kb_builder.as_markup(row_width=2)
-    await message.answer("Выберите маркет:", reply_markup=kb)
+    await message.answer("Отправьте Excel файл с маркетами для импорта.")
 
-# --- Обработка выбора маркетов ---
-@dp.callback_query(lambda c: c.data and c.data.startswith("market:"))
-async def market_callback(callback: types.CallbackQuery):
-    name = callback.data.split("market:")[1]
-    cur.execute("SELECT latitude, longitude FROM markets WHERE name=?", (name,))
-    row = cur.fetchone()
-    if row:
-        lat, lon = row
-        await callback.message.answer(f"{name}\nhttps://www.google.com/maps?q={lat},{lon}")
-    await callback.answer()
+@dp.message(Command("export"))
+async def cmd_export(message: Message):
+    if message.from_user.id not in ADMINS:
+        await message.answer("Нет прав для этой команды.")
+        return
+    df = pd.DataFrame(get_all_markets(), columns=["name", "latitude", "longitude"])
+    df.to_excel("exported_markets.xlsx", index=False)
+    await message.answer_document(document=open("exported_markets.xlsx", "rb"))
 
-# --- Старт бота ---
+@dp.message()
+async def handle_docs(message: Message):
+    if message.from_user.id not in ADMINS:
+        return  # Обычные пользователи не могут загружать файлы
+
+    if not message.document or not message.document.file_name.endswith(".xlsx"):
+        return
+
+    file = await bot.get_file(message.document.file_id)
+    file_path = file.file_path
+    await bot.download_file(file_path, destination="import.xlsx")
+
+    df = pd.read_excel("import.xlsx")
+    add_markets_from_df(df)
+    await message.answer("Маркет импортирован и заменил старые.")
+
+# ===== Запуск бота =====
 async def main():
-    print("Бот запущен!")
-    await dp.start_polling(bot)
+    init_db()
+    await bot.delete_webhook(drop_pending_updates=True)  # Чтобы избежать конфликта
+    try:
+        print("Бот запущен через long polling...")
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
