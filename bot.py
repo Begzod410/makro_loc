@@ -1,13 +1,18 @@
+import os
 import asyncio
 import sqlite3
+import pandas as pd
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
-import pandas as pd
 
 # ===== Конфигурация =====
-TOKEN = "7294777489:AAFMvo3UvtnuOvpYyDIldCi0GuGyrTvyZHM"
-ADMINS = [329116625, 866826839]  # Список ID админов
+TOKEN = os.getenv("BOT_TOKEN")  # токен бота из Render Environment
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN не найден. Установите переменную окружения на Render.")
+
+# список админов (например: "123456789,987654321")
+ADMINS = list(map(int, os.getenv("ADMINS", "329116625,866826839").split(",")))
 
 DB_PATH = "markets.db"
 
@@ -50,7 +55,7 @@ def get_all_markets():
     conn.close()
     return rows
 
-# ===== Клавиатура для обычного пользователя =====
+# ===== Клавиатура для пользователя =====
 def make_user_keyboard():
     kb = InlineKeyboardMarkup(row_width=2)
     markets = get_all_markets()
@@ -59,13 +64,11 @@ def make_user_keyboard():
     return kb
 
 # ===== Хэндлеры =====
-
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer("Привет! Вот список маркетов:", reply_markup=make_user_keyboard())
 
-# ===== Админ команды =====
-
+# ===== Админ-команды =====
 @dp.message(Command("import"))
 async def cmd_import(message: Message):
     if message.from_user.id not in ADMINS:
@@ -96,14 +99,14 @@ async def handle_docs(message: Message):
 
     df = pd.read_excel("import.xlsx")
     add_markets_from_df(df)
-    await message.answer("Маркет импортирован и заменил старые.")
+    await message.answer("✅ Маркеты импортированы и заменили старые.")
 
 # ===== Запуск бота =====
 async def main():
     init_db()
-    await bot.delete_webhook(drop_pending_updates=True)  # Чтобы избежать конфликта
+    await bot.delete_webhook(drop_pending_updates=True)
     try:
-        print("Бот запущен через long polling...")
+        print("🚀 Бот запущен через long polling...")
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
